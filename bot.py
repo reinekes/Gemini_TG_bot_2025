@@ -1,11 +1,13 @@
 import os
-from telegram import Update, ReplyKeyboardMarkup
+from telegram import Update, ReplyKeyboardMarkup, Document
 from telegram.constants import ChatAction
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters, ConversationHandler
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 import requests
+import httpx
+import io
 
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
@@ -28,6 +30,7 @@ MENU_TEXT = (
     "/idea — генерация идей\n"
     "/story — креатив: стих, рассказ, шутка\n"
     "/image — анализ изображения (отправь фото или картинку)\n"
+    "/pdf — анализ PDF-документа (отправь файл или ссылку)\n"
     "/reset — сбросить диалоговый контекст\n"
     "\nПросто напиши сообщение — я отвечу как умный ассистент!"
 )
@@ -82,6 +85,13 @@ async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text('Отправь мне фото или картинку, и я опишу, что на ней изображено.')
     context.user_data['mode'] = 'image'
 
+async def pdf_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_chat or not update.message or context.user_data is None:
+        return
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+    await update.message.reply_text('Отправь мне PDF-файл или ссылку на PDF-документ, и я сделаю его резюме.')
+    context.user_data['mode'] = 'pdf'
+
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or not update.message or context.user_data is None:
         return
@@ -90,9 +100,59 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.message.reply_text('Контекст диалога сброшен!')
 
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.document:
+        return
+    document: Document = update.message.document
+    if document.mime_type != 'application/pdf':
+        await update.message.reply_text('Пожалуйста, отправь PDF-файл.')
+        return
+    chat_id = update.effective_chat.id if update.effective_chat else update.message.chat_id
+    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+    file = await document.get_file()
+    file_bytes = await file.download_as_bytearray()
+    try:
+        pdf_part = types.Part.from_bytes(data=bytes(file_bytes), mime_type='application/pdf')
+        prompt = "Сделай краткое резюме этого PDF-документа."
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[pdf_part, prompt]
+        )
+        answer = response.text if response.text else 'Нет ответа от Gemini.'
+    except Exception as e:
+        answer = f'Ошибка анализа PDF: {e}'
+    await update.message.reply_text(answer)
+
+async def handle_pdf_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return False
+    text = update.message.text.strip()
+    if text.lower().endswith('.pdf') and (text.startswith('http://') or text.startswith('https://')):
+        chat_id = update.effective_chat.id if update.effective_chat else update.message.chat_id
+        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+        try:
+            pdf_bytes = httpx.get(text, timeout=30).content
+            pdf_part = types.Part.from_bytes(data=pdf_bytes, mime_type='application/pdf')
+            prompt = "Сделай краткое резюме этого PDF-документа."
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=[pdf_part, prompt]
+            )
+            answer = response.text if response.text else 'Нет ответа от Gemini.'
+        except Exception as e:
+            answer = f'Ошибка анализа PDF по ссылке: {e}'
+        await update.message.reply_text(answer)
+        return True
+    return False
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text or not update.effective_user or context.user_data is None:
         return
+    # Проверяем, не PDF-ссылка ли это
+    if context.user_data.get('mode') == 'pdf':
+        if await handle_pdf_link(update, context):
+            context.user_data.pop('mode', None)
+            return
     chat_id = update.effective_chat.id if update.effective_chat else update.message.chat_id
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
     user_id = update.effective_user.id
@@ -119,6 +179,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         prompt = f'Сгенерируй {user_message} на русском языке.'
         if context.user_data:
             context.user_data.pop('mode', None)
+    elif mode == 'pdf':
+        await update.message.reply_text('Пожалуйста, отправь PDF-файл или ссылку на PDF.')
+        return
     else:
         # Диалоговый режим с контекстом
         history = user_context.get(user_id, [])
@@ -170,8 +233,10 @@ if __name__ == '__main__':
     app.add_handler(CommandHandler('idea', idea))
     app.add_handler(CommandHandler('story', story))
     app.add_handler(CommandHandler('image', image_command))
+    app.add_handler(CommandHandler('pdf', pdf_command))
     app.add_handler(CommandHandler('reset', reset))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.Document.PDF, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     print('Бот запущен...')
     app.run_polling() 

@@ -4,6 +4,8 @@ from telegram.constants import ChatAction
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters, ConversationHandler
 from dotenv import load_dotenv
 from google import genai
+from google.genai import types
+import requests
 
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
@@ -25,6 +27,7 @@ MENU_TEXT = (
     "/code — генерация/объяснение кода\n"
     "/idea — генерация идей\n"
     "/story — креатив: стих, рассказ, шутка\n"
+    "/image — анализ изображения (отправь фото или картинку)\n"
     "/reset — сбросить диалоговый контекст\n"
     "\nПросто напиши сообщение — я отвечу как умный ассистент!"
 )
@@ -71,6 +74,13 @@ async def story(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
     await update.message.reply_text('Что сгенерировать? (стих, рассказ, шутку, сказку и т.д.)')
     context.user_data['mode'] = 'story'
+
+async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_chat or not update.message or context.user_data is None:
+        return
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+    await update.message.reply_text('Отправь мне фото или картинку, и я опишу, что на ней изображено.')
+    context.user_data['mode'] = 'image'
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or not update.message or context.user_data is None:
@@ -128,6 +138,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         answer = f'Ошибка Gemini API: {e}'
     await update.message.reply_text(answer)
 
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.photo:
+        return
+    chat_id = update.effective_chat.id if update.effective_chat else update.message.chat_id
+    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+    # Получаем наибольшее по размеру фото
+    photo = update.message.photo[-1]
+    photo_file = await photo.get_file()
+    photo_bytes = await photo_file.download_as_bytearray()
+    # Отправляем изображение в Gemini
+    try:
+        image_part = types.Part.from_bytes(data=bytes(photo_bytes), mime_type='image/jpeg')
+        prompt = "Опиши, что изображено на этом фото."
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[image_part, prompt]
+        )
+        answer = response.text if response.text else 'Нет ответа от Gemini.'
+    except Exception as e:
+        answer = f'Ошибка анализа изображения: {e}'
+    await update.message.reply_text(answer)
+
 if __name__ == '__main__':
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler('start', start))
@@ -137,7 +169,9 @@ if __name__ == '__main__':
     app.add_handler(CommandHandler('code', code))
     app.add_handler(CommandHandler('idea', idea))
     app.add_handler(CommandHandler('story', story))
+    app.add_handler(CommandHandler('image', image_command))
     app.add_handler(CommandHandler('reset', reset))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     print('Бот запущен...')
     app.run_polling() 

@@ -1,5 +1,5 @@
 import os
-from telegram import Update, ReplyKeyboardMarkup, Document, Video
+from telegram import Update, ReplyKeyboardMarkup, Document, Video, Audio, Voice
 from telegram.constants import ChatAction
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters, ConversationHandler
 from dotenv import load_dotenv
@@ -32,6 +32,7 @@ MENU_TEXT = (
     "/image — анализ изображения (отправь фото или картинку)\n"
     "/pdf — анализ PDF-документа (отправь файл или ссылку)\n"
     "/video — анализ видео (отправь видеофайл или ссылку на YouTube)\n"
+    "/audio — анализ аудио (отправь аудиофайл)\n"
     "/reset — сбросить диалоговый контекст\n"
     "\nПросто напиши сообщение — я отвечу как умный ассистент!"
 )
@@ -99,6 +100,13 @@ async def video_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
     await update.message.reply_text('Отправь мне видеофайл (mp4, mov и др., до 20 МБ) или ссылку на YouTube, и я сделаю его резюме.')
     context.user_data['mode'] = 'video'
+
+async def audio_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_chat or not update.message or context.user_data is None:
+        return
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+    await update.message.reply_text('Отправь мне аудиофайл (mp3, wav, ogg и др., до 20 МБ), и я сделаю его резюме или транскрипцию.')
+    context.user_data['mode'] = 'audio'
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or not update.message or context.user_data is None:
@@ -194,10 +202,35 @@ async def handle_youtube_link(update: Update, context: ContextTypes.DEFAULT_TYPE
         return True
     return False
 
+async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or (not update.message.audio and not update.message.voice):
+        return
+    chat_id = update.effective_chat.id if update.effective_chat else update.message.chat_id
+    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+    # Определяем тип аудио
+    if update.message.audio:
+        audio_file = await update.message.audio.get_file()
+        mime_type = update.message.audio.mime_type or 'audio/mp3'
+    else:
+        audio_file = await update.message.voice.get_file()
+        mime_type = 'audio/ogg'
+    audio_bytes = await audio_file.download_as_bytearray()
+    try:
+        audio_part = types.Part.from_bytes(data=bytes(audio_bytes), mime_type=mime_type)
+        prompt = "Сделай краткое резюме и транскрипцию этого аудиофайла."
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[prompt, audio_part]
+        )
+        answer = response.text if response.text else 'Нет ответа от Gemini.'
+    except Exception as e:
+        answer = f'Ошибка анализа аудио: {e}'
+    await update.message.reply_text(answer)
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text or not update.effective_user or context.user_data is None:
         return
-    # Проверяем, не PDF-ссылка или YouTube-ссылка ли это
+    # Проверяем, не PDF-ссылка, YouTube-ссылка или режим аудио
     if context.user_data.get('mode') == 'pdf':
         if await handle_pdf_link(update, context):
             context.user_data.pop('mode', None)
@@ -206,6 +239,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if await handle_youtube_link(update, context):
             context.user_data.pop('mode', None)
             return
+    if context.user_data.get('mode') == 'audio':
+        await update.message.reply_text('Пожалуйста, отправь аудиофайл (mp3, wav, ogg и др., до 20 МБ).')
+        return
     chat_id = update.effective_chat.id if update.effective_chat else update.message.chat_id
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
     user_id = update.effective_user.id
@@ -237,6 +273,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     elif mode == 'video':
         await update.message.reply_text('Пожалуйста, отправь видеофайл (mp4, mov и др., до 20 МБ) или ссылку на YouTube.')
+        return
+    elif mode == 'audio':
+        await update.message.reply_text('Пожалуйста, отправь аудиофайл (mp3, wav, ogg и др., до 20 МБ).')
         return
     else:
         # Диалоговый режим с контекстом
@@ -291,10 +330,12 @@ if __name__ == '__main__':
     app.add_handler(CommandHandler('image', image_command))
     app.add_handler(CommandHandler('pdf', pdf_command))
     app.add_handler(CommandHandler('video', video_command))
+    app.add_handler(CommandHandler('audio', audio_command))
     app.add_handler(CommandHandler('reset', reset))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.PDF, handle_document))
     app.add_handler(MessageHandler(filters.VIDEO, handle_video))
+    app.add_handler(MessageHandler(filters.AUDIO | filters.VOICE, handle_audio))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     print('Бот запущен...')
     app.run_polling() 

@@ -1,5 +1,5 @@
 import os
-from telegram import Update, ReplyKeyboardMarkup, Document
+from telegram import Update, ReplyKeyboardMarkup, Document, Video
 from telegram.constants import ChatAction
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters, ConversationHandler
 from dotenv import load_dotenv
@@ -31,6 +31,7 @@ MENU_TEXT = (
     "/story — креатив: стих, рассказ, шутка\n"
     "/image — анализ изображения (отправь фото или картинку)\n"
     "/pdf — анализ PDF-документа (отправь файл или ссылку)\n"
+    "/video — анализ видео (отправь видеофайл или ссылку на YouTube)\n"
     "/reset — сбросить диалоговый контекст\n"
     "\nПросто напиши сообщение — я отвечу как умный ассистент!"
 )
@@ -92,6 +93,13 @@ async def pdf_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text('Отправь мне PDF-файл или ссылку на PDF-документ, и я сделаю его резюме.')
     context.user_data['mode'] = 'pdf'
 
+async def video_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_chat or not update.message or context.user_data is None:
+        return
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+    await update.message.reply_text('Отправь мне видеофайл (mp4, mov и др., до 20 МБ) или ссылку на YouTube, и я сделаю его резюме.')
+    context.user_data['mode'] = 'video'
+
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or not update.message or context.user_data is None:
         return
@@ -145,12 +153,57 @@ async def handle_pdf_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return True
     return False
 
+async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.video:
+        return
+    video: Video = update.message.video
+    chat_id = update.effective_chat.id if update.effective_chat else update.message.chat_id
+    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+    file = await video.get_file()
+    video_bytes = await file.download_as_bytearray()
+    try:
+        video_part = types.Part.from_bytes(data=bytes(video_bytes), mime_type='video/mp4')
+        prompt = "Сделай краткое резюме этого видео."
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[video_part, prompt]
+        )
+        answer = response.text if response.text else 'Нет ответа от Gemini.'
+    except Exception as e:
+        answer = f'Ошибка анализа видео: {e}'
+    await update.message.reply_text(answer)
+
+async def handle_youtube_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return False
+    text = update.message.text.strip()
+    if 'youtube.com/watch' in text or 'youtu.be/' in text:
+        chat_id = update.effective_chat.id if update.effective_chat else update.message.chat_id
+        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+        try:
+            video_part = types.Part(file_data=types.FileData(file_uri=text))
+            prompt = "Сделай краткое резюме этого видео."
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=[video_part, prompt]
+            )
+            answer = response.text if response.text else 'Нет ответа от Gemini.'
+        except Exception as e:
+            answer = f'Ошибка анализа YouTube-видео: {e}'
+        await update.message.reply_text(answer)
+        return True
+    return False
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text or not update.effective_user or context.user_data is None:
         return
-    # Проверяем, не PDF-ссылка ли это
+    # Проверяем, не PDF-ссылка или YouTube-ссылка ли это
     if context.user_data.get('mode') == 'pdf':
         if await handle_pdf_link(update, context):
+            context.user_data.pop('mode', None)
+            return
+    if context.user_data.get('mode') == 'video':
+        if await handle_youtube_link(update, context):
             context.user_data.pop('mode', None)
             return
     chat_id = update.effective_chat.id if update.effective_chat else update.message.chat_id
@@ -181,6 +234,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data.pop('mode', None)
     elif mode == 'pdf':
         await update.message.reply_text('Пожалуйста, отправь PDF-файл или ссылку на PDF.')
+        return
+    elif mode == 'video':
+        await update.message.reply_text('Пожалуйста, отправь видеофайл (mp4, mov и др., до 20 МБ) или ссылку на YouTube.')
         return
     else:
         # Диалоговый режим с контекстом
@@ -234,9 +290,11 @@ if __name__ == '__main__':
     app.add_handler(CommandHandler('story', story))
     app.add_handler(CommandHandler('image', image_command))
     app.add_handler(CommandHandler('pdf', pdf_command))
+    app.add_handler(CommandHandler('video', video_command))
     app.add_handler(CommandHandler('reset', reset))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.PDF, handle_document))
+    app.add_handler(MessageHandler(filters.VIDEO, handle_video))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     print('Бот запущен...')
     app.run_polling() 

@@ -1,6 +1,7 @@
 import os
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram import Update, ReplyKeyboardMarkup
+from telegram.constants import ChatAction
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters, ConversationHandler
 from dotenv import load_dotenv
 from google import genai
 
@@ -13,20 +14,116 @@ if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
+# Для хранения контекста диалога
+user_context = {}
+
+MENU_TEXT = (
+    "Я — многофункциональный Gemini-бот!\n\n"
+    "Доступные команды:\n"
+    "/summarize — резюмировать текст\n"
+    "/translate — перевод текста\n"
+    "/code — генерация/объяснение кода\n"
+    "/idea — генерация идей\n"
+    "/story — креатив: стих, рассказ, шутка\n"
+    "/reset — сбросить диалоговый контекст\n"
+    "\nПросто напиши сообщение — я отвечу как умный ассистент!"
+)
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message:
-        await update.message.reply_text('Привет! Задай мне любой вопрос.')
+        await update.message.reply_text(MENU_TEXT)
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message:
+        await update.message.reply_text(MENU_TEXT)
+
+async def summarize(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_chat or not update.message or context.user_data is None:
+        return
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+    await update.message.reply_text('Пришли мне текст, который нужно резюмировать.')
+    context.user_data['mode'] = 'summarize'
+
+async def translate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_chat or not update.message or context.user_data is None:
+        return
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+    await update.message.reply_text('Пришли мне текст для перевода (язык определю автоматически).')
+    context.user_data['mode'] = 'translate'
+
+async def code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_chat or not update.message or context.user_data is None:
+        return
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+    await update.message.reply_text('Опиши задачу или пришли код — я помогу с генерацией или объяснением.')
+    context.user_data['mode'] = 'code'
+
+async def idea(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_chat or not update.message or context.user_data is None:
+        return
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+    await update.message.reply_text('О чём нужна идея? (например: стартап, подарок, мероприятие)')
+    context.user_data['mode'] = 'idea'
+
+async def story(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_chat or not update.message or context.user_data is None:
+        return
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+    await update.message.reply_text('Что сгенерировать? (стих, рассказ, шутку, сказку и т.д.)')
+    context.user_data['mode'] = 'story'
+
+async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or not update.message or context.user_data is None:
+        return
+    user_id = update.effective_user.id
+    user_context.pop(user_id, None)
+    context.user_data.clear()
+    await update.message.reply_text('Контекст диалога сброшен!')
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
+    if not update.message or not update.message.text or not update.effective_user or context.user_data is None:
         return
+    chat_id = update.effective_chat.id if update.effective_chat else update.message.chat_id
+    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+    user_id = update.effective_user.id
     user_message = update.message.text
+    mode = context.user_data.get('mode') if context.user_data else None
+    prompt = ''
+    if mode == 'summarize':
+        prompt = f'Сделай краткое резюме следующего текста на русском языке:\n{user_message}'
+        if context.user_data:
+            context.user_data.pop('mode', None)
+    elif mode == 'translate':
+        prompt = f'Переведи на русский или английский язык (определи автоматически, какой нужен перевод):\n{user_message}'
+        if context.user_data:
+            context.user_data.pop('mode', None)
+    elif mode == 'code':
+        prompt = f'Помоги с кодом или объясни его. Запрос: {user_message}'
+        if context.user_data:
+            context.user_data.pop('mode', None)
+    elif mode == 'idea':
+        prompt = f'Сгенерируй креативные идеи по теме: {user_message}'
+        if context.user_data:
+            context.user_data.pop('mode', None)
+    elif mode == 'story':
+        prompt = f'Сгенерируй {user_message} на русском языке.'
+        if context.user_data:
+            context.user_data.pop('mode', None)
+    else:
+        # Диалоговый режим с контекстом
+        history = user_context.get(user_id, [])
+        history.append({'role': 'user', 'text': user_message})
+        prompt = f'Веди диалог, учитывая предыдущие сообщения: {user_message}'
+        user_context[user_id] = history[-10:]  # Храним последние 10 сообщений
     try:
         response = client.models.generate_content(
             model="gemini-2.5-flash",
-            contents=user_message
+            contents=prompt
         )
         answer = response.text if response.text else 'Нет ответа от Gemini.'
+        # Добавляем ответ в контекст
+        if mode is None:
+            user_context[user_id].append({'role': 'assistant', 'text': answer})
     except Exception as e:
         answer = f'Ошибка Gemini API: {e}'
     await update.message.reply_text(answer)
@@ -34,6 +131,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 if __name__ == '__main__':
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler('start', start))
+    app.add_handler(CommandHandler('help', help_command))
+    app.add_handler(CommandHandler('summarize', summarize))
+    app.add_handler(CommandHandler('translate', translate))
+    app.add_handler(CommandHandler('code', code))
+    app.add_handler(CommandHandler('idea', idea))
+    app.add_handler(CommandHandler('story', story))
+    app.add_handler(CommandHandler('reset', reset))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     print('Бот запущен...')
     app.run_polling() 
